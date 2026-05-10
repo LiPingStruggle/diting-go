@@ -298,13 +298,12 @@ func min(a, b int) int {
 }
 
 func extractFunctions(code string) string {
-	re := regexp.MustCompile(`(?m)^func\s+\w+|^def\s+\w+`)
-	matches := re.FindAllString(code, -1)
+	re := regexp.MustCompile(`(?:func|def)\s+(\w+)`)
+	matches := re.FindAllStringSubmatch(code, -1)
 	var funcs []string
 	for _, m := range matches {
-		parts := strings.Fields(m)
-		if len(parts) >= 2 {
-			funcs = append(funcs, parts[1])
+		if len(m) >= 2 && m[1] != `` {
+			funcs = append(funcs, m[1])
 		}
 	}
 	if len(funcs) > 5 {
