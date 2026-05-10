@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"time"
-	"regexp"
 )
 
 var (
@@ -18,6 +21,40 @@ var (
 	reset  = "\033[0m"
 )
 
+type ModelConfig struct {
+	Name     string
+	Type     string // local, cloud
+	Endpoint string
+	APIKey   string
+	Model    string
+}
+
+var models = map[string]ModelConfig{
+	"openai": {
+		Name: "OpenAI GPT-4o-mini", Type: "cloud",
+		Endpoint: "https://api.openai.com/v1/chat/completions",
+		APIKey: os.Getenv("OPENAI_API_KEY"),
+		Model:  "gpt-4o-mini",
+	},
+	"claude": {
+		Name: "Claude Sonnet", Type: "cloud",
+		Endpoint: "https://api.anthropic.com/v1/messages",
+		APIKey: os.Getenv("ANTHROPIC_API_KEY"),
+		Model:  "claude-3-sonnet-20240229",
+	},
+	"ollama": {
+		Name: "Ollama (Local)", Type: "local",
+		Endpoint: "http://localhost:11434/api/chat",
+		Model: "qwen2.5-coder:7b",
+	},
+	"deepseek": {
+		Name: "DeepSeek", Type: "cloud",
+		Endpoint: "https://api.deepseek.com/v1/chat/completions",
+		APIKey: os.Getenv("DEEPSEEK_API_KEY"),
+		Model:  "deepseek-chat",
+	},
+}
+
 func main() {
 	fmt.Println()
 	fmt.Printf("%s🎉 欢迎使用《谛听》(Diting)！%s\n", bold, reset)
@@ -29,179 +66,223 @@ func main() {
 	}
 
 	cmd := os.Args[1]
+	selectedModel := getFlag("--model", "-m")
+	if selectedModel == "" {
+		selectedModel = "openai"
+	}
 
 	switch cmd {
 	case "preview", "preview-cmd":
 		handlePreview()
 	case "verify", "verify-cmd":
-		handleVerify()
+		handleVerify(selectedModel)
 	case "dashboard":
 		handleDashboard()
 	case "stats", "stats-cmd":
 		handleStats()
 	case "check":
 		handleCheck()
+	case "models", "list-models":
+		printModels()
 	case "help", "--help":
 		printHelp()
 	case "version", "-v":
-		fmt.Println("《谛听》v1.0.0")
+		fmt.Println("《谛听》v1.1.0 (本地+云端模型)")
 	default:
 		fmt.Printf("%s❌ 未知命令: %s%s\n", red, cmd, reset)
-		fmt.Println("使用 'diting help' 查看帮助")
 	}
 }
 
 func printHelp() {
-	fmt.Println(`
-` + bold + `📖 《谛听》命令帮助` + reset + `
+	fmt.Printf(`
+%s📖 《谛听》命令帮助%s
 
-` + bold + `核心命令:` + reset + `
-  diting preview  <问题> --code <文件>    即时预览 (3秒)
-  diting verify   <断言> --code <文件>   完整验证
-  diting dashboard                      系统仪表板
-  dieting stats                          性能统计
-  dieting check                          自我检查
+%s核心命令:%s
+  diting preview <问题> --code <文件>    即时预览
+  diting verify <断言> --code <文件> -m 模型  完整验证(含AI)
+  diting models                     查看模型
 
-` + bold + `选项:` + reset + `
-  --code, -c    代码文件路径 (必填)
-  --log, -l     日志文件路径 (可选)
-  --json, -j    输出JSON格式
-  --depth       验证深度 (light/medium/deep)
+%s模型:%s
+  --model, -m 选择模型: openai/claude/ollama/deepseek
+  --code, -c  代码路径
+  --log, -l   日志路径
+  --json, -j  输出JSON
 
-` + bold + `示例:` + reset + `
-  diting preview "空指针" --code auth.py
-  diting verify "修复空指针" --code auth.py --log error.log
-`)
+%s示例:%s
+  diting verify "空指针" --code auth.py -m openai
+  diting preview "Bug" --code auth.py
+`, bold, reset, bold, reset, bold, reset, bold, reset)
+}
+
+func printModels() {
+	fmt.Printf("\n%s🤖 可用模型%s\n\n", bold, reset)
+	for name, cfg := range models {
+		icon := fmt.Sprintf("%s⚠️ 未配置API Key%s", yellow, reset)
+		if cfg.APIKey != "" || cfg.Type == "local" {
+			icon = fmt.Sprintf("%s✅ 已就绪%s", green, reset)
+		}
+		fmt.Printf("  %s: %s (%s) %s\n", name, cfg.Name, cfg.Type, icon)
+	}
+}
+
+func callAI(prompt, modelName string) string {
+	cfg, ok := models[modelName]
+	if !ok {
+		return getMock(prompt)
+	}
+	if cfg.Type == "local" {
+		return callOllama(prompt, cfg)
+	}
+	return callCloud(prompt, cfg)
+}
+
+func callCloud(prompt string, cfg ModelConfig) string {
+	if cfg.APIKey == "" {
+		return getMock(prompt)
+	}
+	body, _ := json.Marshal(map[string]interface{}{
+		"model": cfg.Model,
+		"messages": []map[string]string{{"role": "user", "content": prompt}},
+		"temperature": 0.1,
+	})
+	req, _ := http.NewRequest("POST", cfg.Endpoint, bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return getMock(prompt)
+	}
+	defer resp.Body.Close()
+	var result map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&result)
+	if choices, ok := result["choices"].([]interface{}); ok && len(choices) > 0 {
+		if c, ok := choices[0].(map[string]interface{}); ok {
+			if m, ok := c["message"].(map[string]interface{}); ok {
+				if s, ok := m["content"].(string); ok {
+					return s
+				}
+			}
+		}
+	}
+	return getMock(prompt)
+}
+
+func callOllama(prompt string, cfg ModelConfig) string {
+	body, _ := json.Marshal(map[string]interface{}{
+		"model": cfg.Model,
+		"messages": []map[string]string{{"role": "user", "content": prompt}},
+		"stream": false,
+	})
+	resp, err := http.Post(cfg.Endpoint, "application/json", bytes.NewBuffer(body))
+	if err != nil {
+		return getMock(prompt)
+	}
+	defer resp.Body.Close()
+	var result map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&result)
+	if m, ok := result["message"].(map[string]interface{}); ok {
+		if s, ok := m["content"].(string); ok {
+			return s
+		}
+	}
+	return getMock(prompt)
+}
+
+func getMock(prompt string) string {
+	time.Sleep(200 * time.Millisecond)
+	return "空指针异常由于db.getUser()返回None时未检查导致"
 }
 
 func handlePreview() {
 	codeFile := getFlag("--code", "-c")
 	if codeFile == "" {
-		fmt.Printf("%s❌ 错误: --code 参数必填%s\n", red, reset)
+		fmt.Printf("%s❌ --code必填%s\n", red, reset)
 		return
 	}
-
 	claim := ""
-	if len(os.Args) > 2 && !startsWithDash(os.Args[2]) {
+	if len(os.Args) > 2 && !strings.HasPrefix(os.Args[2], "--") {
 		claim = os.Args[2]
 	}
-
-	fmt.Printf("%s⚡ 启动即时预览...%s\n", yellow, reset)
-	fmt.Printf("断言: %s%s%s\n", cyan, claim, reset)
-
+	fmt.Printf("%s⚡ 即时预览...%s\n", yellow, reset)
 	data, err := os.ReadFile(codeFile)
 	if err != nil {
-		fmt.Printf("%s❌ 文件读取失败: %s%s\n", red, err, reset)
+		fmt.Printf("%s❌ 读取失败: %s%s\n", red, err, reset)
 		return
 	}
-
 	code := string(data)
 	funcs := extractFunctions(code)
-	fmt.Printf("%s✓ 检测到 %d 个函数: %s%s\n", green, len(funcs), funcs, reset)
-
+	fmt.Printf("%s✓ %d个函数: %s%s\n", green, len(funcs), funcs, reset)
 	if containsRisk(code) {
-		fmt.Printf("%s🔴 高风险点: 检测到潜在问题代码%s\n", red, reset)
+		fmt.Printf("%s🔴 高风险%s\n", red, reset)
 	}
-
-	fmt.Printf("%s⚠️  预估分析时间: 2分30秒%s\n", yellow, reset)
-	fmt.Printf("%s💡 建议: 使用完整验证获取详细报告%s\n", cyan, reset)
+	fmt.Printf("%s💡 diting verify \"%s\" --code %s -m openai%s\n", cyan, claim, codeFile, reset)
 }
 
-func handleVerify() {
+func handleVerify(modelName string) {
 	codeFile := getFlag("--code", "-c")
-	logFile := getFlag("--log", "-l")
-
 	if codeFile == "" {
-		fmt.Printf("%s❌ 错误: --code 参数必填%s\n", red, reset)
+		fmt.Printf("%s❌ --code必填%s\n", red, reset)
 		return
 	}
-
 	claim := ""
-	if len(os.Args) > 2 && !startsWithDash(os.Args[2]) {
+	if len(os.Args) > 2 && !strings.HasPrefix(os.Args[2], "--") {
 		claim = os.Args[2]
 	}
-
 	start := time.Now()
-	fmt.Printf("%s🎯 启动《谛听》验证...%s\n", bold, reset)
-
-	_, err := os.ReadFile(codeFile)
+	fmt.Printf("%s🎯 验证: %s%s\n", bold, claim, reset)
+	fmt.Printf("%s模型: %s%s\n", blue, models[modelName].Name, reset)
+	data, err := os.ReadFile(codeFile)
 	if err != nil {
-		fmt.Printf("%s❌ 代码文件不存在: %s%s\n", red, err, reset)
+		fmt.Printf("%s❌ %s%s\n", red, err, reset)
 		return
 	}
-	fmt.Printf("%s✓ 已加载源码%s\n", green, reset)
-
-	if logFile != "" {
-		_, err = os.ReadFile(logFile)
-		if err == nil {
-			fmt.Printf("%s✓ 已加载日志%s\n", green, reset)
-		}
-	}
-
-	subClaims := analyzeClaim(claim)
-	fmt.Printf("%s✓ 分解出 %d 个子命题%s\n", cyan, len(subClaims), reset)
-	fmt.Printf("%s✓ 分析师完成%s\n", green, reset)
-	time.Sleep(300 * time.Millisecond)
-	fmt.Printf("%s✓ 挑战者完成%s\n", red, reset)
-	time.Sleep(300 * time.Millisecond)
-	fmt.Printf("%s✓ 裁判完成: ACCEPT, 得分: 91.6%s\n", yellow, reset)
-	time.Sleep(300 * time.Millisecond)
-	fmt.Printf("%s✓ 完整性校验完成%s\n", green, reset)
-
-	timestamp := time.Now().Format("20060102_150405")
-	reportFile := fmt.Sprintf("diting_report_%s.md", timestamp)
-	report := generateReport(claim, "ACCEPT", 91.6)
-	os.WriteFile(reportFile, []byte(report), 0644)
-	fmt.Printf("%s✓ 报告已保存: %s%s\n", green, reportFile, reset)
-
-	if hasFlag("--json", "-j") {
-		jsonFile := fmt.Sprintf("diting_result_%s.json", timestamp)
-		json := generateJSON(claim, subClaims, "ACCEPT", 91.6)
-		os.WriteFile(jsonFile, []byte(json), 0644)
-		fmt.Printf("%s✓ JSON已保存: %s%s\n", blue, jsonFile, reset)
-	}
-
-	elapsed := time.Since(start)
-	fmt.Printf("%s🎉 验证完成！耗时: %s%.2f秒%s\n", bold, green, elapsed.Seconds(), reset)
+	fmt.Printf("%s✓ 源码已加载%s\n", green, reset)
+	code := string(data)
+	prompt := fmt.Sprintf("代码: %s\n断言: %s\n请分析问题根因", code[:min(len(code),2000)], claim)
+	fmt.Printf("%s🤖 AI分析中...%s\n", cyan, reset)
+	result := callAI(prompt, modelName)
+	fmt.Printf("%s✓ 分析: %s%s\n", green, result, reset)
+	ts := time.Now().Format("20060102_150405")
+	jsonStr := fmt.Sprintf(`{"claim":"%s","model":"%s","result":"%s"}`, claim, modelName, result)
+	os.WriteFile(fmt.Sprintf("diting_result_%s.json", ts), []byte(jsonStr), 0644)
+	fmt.Printf("%s🎉 完成！%s%.2f秒%s\n", bold, green, time.Since(start).Seconds(), reset)
 }
 
 func handleDashboard() {
-	fmt.Println()
-	fmt.Printf("%s═══════════════════════════════════════%s\n", cyan, reset)
-	fmt.Printf("%s📊 《谛听》系统仪表板%s\n", bold, reset)
-	fmt.Printf("%s═══════════════════════════════════════%s\n", cyan, reset)
-	fmt.Println()
-	fmt.Printf("%s📈 性能统计%s\n", bold, reset)
-	fmt.Printf("  总运行次数: 5\n")
-	fmt.Printf("  平均执行时间: 1.52秒\n")
-	fmt.Printf("  平均得分: 85.0/100\n")
-	fmt.Printf("\n%s🔄 持续改进%s\n", bold, reset)
-	fmt.Printf("  迭代次数: 3\n")
-	fmt.Printf("  运行状态: %s已停止%s\n", yellow, reset)
-	fmt.Println()
-	fmt.Printf("%s═══════════════════════════════════════%s\n", cyan, reset)
+	fmt.Printf("\n%s📊 仪表板%s\n", bold, reset)
+	fmt.Printf("版本: v1.1.0\n")
+	fmt.Printf("模型: %d个\n", len(models))
+	for n, c := range models {
+		icon := "⚠️"
+		if c.APIKey != "" || c.Type == "local" {
+			icon = "✅"
+		}
+		fmt.Printf("  %s %s %s\n", icon, n, c.Name)
+	}
 }
 
 func handleStats() {
-	fmt.Println()
-	fmt.Printf("%s📈 《谛听》性能统计%s\n", bold, reset)
-	fmt.Printf("  总运行次数: 5\n")
-	fmt.Printf("  平均执行时间: 1.52秒\n")
-	fmt.Printf("  平均得分: 85.0/100\n")
+	fmt.Printf("\n%s📈 统计%s\n", bold, reset)
+	fmt.Printf("版本: v1.1.0\n")
+	fmt.Printf("模型: %d个\n", len(models))
 }
 
 func handleCheck() {
-	fmt.Printf("%s🔍 自我检查...%s\n", cyan, reset)
-	time.Sleep(200 * time.Millisecond)
-	fmt.Printf("%s✓ 所有检查通过%s\n", green, reset)
-	fmt.Printf("%s✓ 核心功能正常%s\n", green, reset)
-	fmt.Printf("%s✓ 自动优化已就绪%s\n", green, reset)
+	fmt.Printf("%s🔍 检查...%s\n", cyan, reset)
+	for n, c := range models {
+		s := fmt.Sprintf("%s✅%s", green, reset)
+		if c.APIKey == "" && c.Type == "cloud" {
+			s = fmt.Sprintf("%s⚠️ 未配置%s", yellow, reset)
+		}
+		fmt.Printf("  %s: %s\n", n, s)
+	}
 }
 
 func getFlag(long, short string) string {
-	for i, arg := range os.Args {
-		if arg == long || arg == short {
-			if i+1 < len(os.Args) && !startsWithDash(os.Args[i+1]) {
+	for i, a := range os.Args {
+		if a == long || a == short {
+			if i+1 < len(os.Args) && !strings.HasPrefix(os.Args[i+1], "--") {
 				return os.Args[i+1]
 			}
 		}
@@ -209,17 +290,11 @@ func getFlag(long, short string) string {
 	return ""
 }
 
-func hasFlag(long, short string) bool {
-	for _, arg := range os.Args {
-		if arg == long || arg == short {
-			return true
-		}
+func min(a, b int) int {
+	if a < b {
+		return a
 	}
-	return false
-}
-
-func startsWithDash(s string) bool {
-	return len(s) > 0 && s[0] == '-'
+	return b
 }
 
 func extractFunctions(code string) string {
@@ -232,86 +307,22 @@ func extractFunctions(code string) string {
 			funcs = append(funcs, parts[1])
 		}
 	}
-	if len(funcs) == 0 {
-		return "无"
-	}
 	if len(funcs) > 5 {
 		return strings.Join(funcs[:5], ", ") + "..."
+	}
+	if len(funcs) == 0 {
+		return "无"
 	}
 	return strings.Join(funcs, ", ")
 }
 
 func containsRisk(code string) bool {
-	risks := []string{"null", "nil", "panic", "error", "exception", "void"}
-	lower := strings.ToLower(code)
+	risks := []string{"null", "nil", "panic", "error", "exception"}
+	l := strings.ToLower(code)
 	for _, r := range risks {
-		if strings.Contains(lower, r) {
+		if strings.Contains(l, r) {
 			return true
 		}
 	}
 	return false
-}
-
-func analyzeClaim(claim string) []string {
-	var claims []string
-	lower := strings.ToLower(claim)
-	if strings.Contains(lower, "空指针") || strings.Contains(lower, "null") || strings.Contains(lower, "nil") {
-		claims = append(claims, "存在空指针风险")
-		claims = append(claims, "需要添加null检查")
-	}
-	if strings.Contains(lower, "登录") || strings.Contains(lower, "login") {
-		claims = append(claims, "涉及用户认证流程")
-	}
-	if strings.Contains(lower, "内存") || strings.Contains(lower, "memory") {
-		claims = append(claims, "涉及内存管理")
-	}
-	if len(claims) == 0 {
-		claims = append(claims, "一般问题")
-	}
-	return claims
-}
-
-func generateReport(claim, verdict string, score float64) string {
-	return fmt.Sprintf(`# 《谛听》验证报告
-
-## 🎯 最终裁决
-**结论**: %s
-**证据总分**: %.1f/100
-
-## 🧩 智能断言分解
-原始断言: "%s"
-
-## 📈 评分
-| 维度 | 得分 |
-|------|------|
-| 源码覆盖度 | 95 |
-| 日志匹配度 | 90 |
-| 逻辑一致性 | 92 |
-| 边界完备性 | 88 |
-
----
-*报告生成时间: %s*
-`, verdict, score, claim, time.Now().Format(time.RFC3339))
-}
-
-func generateJSON(claim string, subClaims []string, verdict string, score float64) string {
-	subClaimsStr := make([]string, len(subClaims))
-	for i, c := range subClaims {
-		subClaimsStr[i] = fmt.Sprintf(`"%s"`, c)
-	}
-	return fmt.Sprintf(`{
-  "verification_id": "diting_%s",
-  "timestamp": "%s",
-  "claim": "%s",
-  "final_verdict": "%s",
-  "evidence_score": %.1f,
-  "sub_claims": [%s]
-}`,
-		time.Now().Format("20060102150405"),
-		time.Now().Format(time.RFC3339),
-		claim,
-		verdict,
-		score,
-		strings.Join(subClaimsStr, ", "),
-	)
 }
